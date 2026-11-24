@@ -1,0 +1,187 @@
+# CLAUDE.md
+
+Guidance for Claude Code (and any other coding agent) working in this repository.
+
+## What this is
+
+Marketing website for **ТОВ АКФ «Бізнес Партнери» / Business Partners** (bp-audit.com.ua), an audit and consulting firm in Lviv, Ukraine. Monorepo with two independent Node apps:
+
+| Dir    | App                                  | Port | Role                                     |
+| ------ | ------------------------------------ | ---- | ---------------------------------------- |
+| `cms/` | Strapi 5 (TypeScript)                | 1337 | Headless CMS: content + leads, admin UI  |
+| `web/` | Next.js 16 App Router, React 19, TS  | 3000 | Public site, reads Strapi REST API       |
+
+Languages: **uk** (default) and **en**. Every page lives under `/{locale}/…`. Unknown browser languages are redirected to `en`, ru/be to `uk`.
+
+Human-facing docs: `README.md`, `docs/ARCHITECTURE.md`, `docs/DEPLOYMENT.md`, `docs/CONTENT-EDITING.md`, `docs/TROUBLESHOOTING.md`.
+
+## Requirements
+
+- **Node.js 22.19+** (`.nvmrc` = 22.22.0) or 24.x. Strapi's `undici@8` needs ≥ 22.19; odd versions (23, 25) have no `better-sqlite3` binaries. `cms/scripts/check-node.mjs` / `web/scripts/check-node.mjs` runs before dev/build and fails fast.
+- npm (lockfiles are committed: use `npm ci` in CI).
+
+## Commands
+
+```bash
+# One-time: generate cms/.env + web/.env.local with random secrets
+node scripts/setup.mjs
+
+# CMS
+cd cms && npm install
+npm run dev          # http://localhost:1337/admin (auto-seeds an empty DB in uk + en)
+npm run reseed       # dev: wipe and re-create all site content from the seed (leads stay)
+npm run build && npm run start
+
+# Web
+cd web && npm install      # STRAPI_WEB_TOKEN is filled by the CMS on first start (dev)
+npm run dev          # http://localhost:3000
+npm run typecheck && npm run lint
+npm test             # vitest unit tests (also `npm test` in cms/)
+npm run build && npm start   # standalone server via scripts/start-standalone.mjs
+```
+
+Always run `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` in `web/` (and `npm test` in `cms/`) after changes. The build needs Strapi running to prerender pages (without it, pages render empty and are revalidated later).
+
+## Next.js 16 specifics — read before writing code
+
+This is **Next.js 16**; APIs differ from older versions you may know. Bundled docs are in `web/node_modules/next/dist/docs/` — check them when unsure.
+
+- `params` / `searchParams` are **Promises**: `const { locale } = await params;`
+- Middleware is called **`proxy.ts`** (`web/src/proxy.ts`): redirects locale-less URLs using the `NEXT_LOCALE` cookie, then `Accept-Language`.
+- `revalidateTag(tag, { expire: 0 })` takes a second argument.
+- `app/[locale]/layout.tsx` is the **root layout**; the home page is `app/[locale]/(home)/page.tsx` (route group, URL unchanged) (renders `<html lang>`); there is no `app/layout.tsx`.
+- `output: 'standalone'`; `agentRules: false` in `next.config.ts` stops Next from generating `AGENTS.md` — this file replaces it. Do not re-create AGENTS.md.
+
+## Conventions
+
+### Styling — Tailwind CSS v4
+- Tokens live in `web/src/app/globals.css` under `@theme` (`bg-accent`, `text-muted`, `border-line`, `rounded-card`, breakpoints `xs` = 400px and `3xl`). No `tailwind.config.js`.
+- Shared class recipes in `web/src/components/ui.ts` (`btn.*`, `chip`, `iconBtn`, `cardHover`, `container`, `field`…). Reuse them.
+- **Every clickable element must have `cursor-pointer`** (links, buttons, summary, select, role=tab…). Base CSS also enforces it, but add the class explicitly in new components.
+- Mobile-first. Check widths 320, 375, 768, 1024, 1280, 1920: no horizontal scroll, tap targets ≥ 44px.
+- Don't combine `hidden sm:inline-flex` with a recipe that already sets `inline-flex` — use `max-sm:hidden` instead.
+- Chip rows (quick services, category nav): `chipGrid` + `chipCell` from `ui.ts` — 2-column grid with wrapping labels on phones, flex-wrap from `sm`. Tabs (`AudienceTabs`) stay a swipeable `snap-x` row.
+- Badges: always `badge.lime | badge.accent | badge.glass` from `ui.ts` (text 11px → 12px → 13px by breakpoint).
+- Never stack two utilities for the same property on one element (`h-11` + `h-auto`, `whitespace-nowrap` + `whitespace-normal`): Tailwind v4 gives no ordering guarantee. Write a standalone recipe instead.
+- Language switcher: custom dropdown of `<Link hrefLang>` items (desktop) and `LanguageChips` (mobile menu); no native `<select>` (its list can't be styled on Windows).
+- `<html>` and `<body>` carry `suppressHydrationWarning` because browser extensions (Grammarly etc.) inject attributes there.
+- Headings get `break-words hyphens-auto`: long Ukrainian words (e.g. «Висококваліфікована») overflow 320px screens otherwise.
+- Ancestors with `backdrop-filter`/`transform` trap `position: fixed` — render overlays through `createPortal(…, document.body)` (see `MobileMenu.tsx`).
+
+### Editorial design (fintexinc.com-style concept)
+- The public pages use the editorial design of the concept mockup: `web/src/app/concept.css` (plain CSS inside Tailwind's `components` layer, imported in the root layout after `globals.css`) + components in `web/src/components/concept/` (`SiteHeader`, `SiteFooter`, `HomeHero`, `Story`, `ScrollWords`, `Glyph`, `ConceptForm`, `ContactSection`, `ArticleView`, `parts.tsx`: `Label`, `PageHead`, `SvcCard`, `PostCard`, `PersonCard`, `FaqList`, `MapCard`, `Prose`).
+- Class names that Tailwind also generates are renamed in concept.css: `sblock`, `ulink`, `c-mt` / `c-mt-s` / `c-mt-lg`, `fine`, `c-right`, `c-center`. Don't add a concept class with a Tailwind utility's name.
+- **Palettes:** B (graphite, base `:root`) and C (warm, `:root[data-palette="c"]`). `<html data-palette>` comes from `NEXT_PUBLIC_PALETTE` (default `b`); the demo `PaletteSwitcher` (hidden with `NEXT_PUBLIC_PALETTE_SWITCHER=0`) stores the choice in localStorage and an inline `beforeInteractive` script applies it before the first paint. The Tailwind colour tokens in `globals.css` point at the palette variables (`--color-ink: var(--ink)`…), so utilities follow the palette too. New colours: add a variable to both palettes.
+- **Motion:** GSAP + ScrollTrigger from npm (`components/concept/gsap.ts`, registered once; no CDN, CSP unchanged). Pinned scenes (`HomeHero`, `Story`) run under `PIN` = any width with a window ≥ 500px tall and motion allowed; otherwise the same markup flows normally. `Story` pins only when the whole block fits under the header. The hero picture is a canvas globe (`globe.ts`, colours from `--cv-*`) until the client has video: put `<video className="media-video" …>` into `.media` and drop the canvas.
+- Rich text in the editorial pages: `<Prose content={…} />` (renders `Blocks` with `bare`, styled by `.prose`).
+- Forms: `ConceptForm` (name + one "phone or e-mail" field, sent as `phone` or `email` to the same `submitLead` action and `lib/lead.ts` validation).
+- The previous UI components (`Header`, `Footer`, `sections.tsx`, most of `bits.tsx`, `LeadForm`, `MapEmbed`, `AudienceTabs`, `MobileActionBar`, `NavLinks`, `ScrollHeader`) are no longer used by pages; `LeadForm`, `MapEmbed`, `Blocks`, `ContentProtection` keep their unit tests. Route skeletons (`loading.tsx`) still use the Tailwind layout (colours follow the palette).
+
+### Motion & loading states
+- **Curves:** use the tokens in `globals.css` (`--ease-out-expo` everywhere, `--ease-spring` for pops). Tailwind: `ease-(--ease-out-expo)`.
+- **Tailwind v4 gotcha:** `translate-*`, `scale-*` and `rotate-*` set the CSS properties `translate` / `scale` / `rotate`, *not* `transform`. Transition those properties (`transition-[translate,box-shadow]`); `transition-transform` won't animate them.
+- **Page transitions:** React `<ViewTransition>` in `app/[locale]/template.tsx` (class `page`). The header (`site-header`) and the mobile bar (`action-bar`) are named so they stay still. Skeletons hand over via `skeleton-out` (in `SkPage`).
+- **Hero / page heads:** `animate-stagger` utility (children rise one after another; tune with `[--stagger-base:…]`, `[--stagger-step:…]`); `marker` utility for the highlighter under accent words.
+- **Scroll reveal** is pure CSS (scroll-driven animations, `animation-timeline: view()`): add `data-reveal` (element) or `data-stagger` (each direct child). No JS and nothing to hydrate; browsers without support just show the content. Don't reintroduce JS that mutates attributes of server-rendered elements, because it causes hydration mismatches.
+- **Hover:** `cardHover` adds `group`, so children use `group-hover:translate-x-1` (arrows) and `group-hover:scale-[1.04]` (images). Buttons lift, press (`active:scale`) and nudge their trailing icon.
+- **Widgets:**
+  - `AudienceTabs`: sliding pill, measured in a layout effect; until measured, the active tab keeps its own background;
+  - `CountUp`: stats count from 0 on first view, but never identifiers like "№" and never with reduced motion;
+  - FAQ: smooth `::details-content` height;
+  - `ScrollHeader`: `data-scrolled`.
+- Above-the-fold content never waits for JS. Everything is disabled under `prefers-reduced-motion`.
+- **Route skeletons:** every route has a `loading.tsx` built from `components/Skeletons.tsx` that mirrors its real layout. When you add a route, add its `loading.tsx`.
+- **Loading boundaries vs. 404s.** A `loading.tsx` makes the response stream, and a streamed response can't change its status to 404 any more. So:
+  - list pages with skeletons live in route groups (`services/(list)/`, `news/(list)/`, `blog/(list)/`, `(home)/`), so their skeleton never wraps the detail pages;
+  - every `[slug]/layout.tsx` checks `slugExists()` *before* the page's own skeleton starts streaming;
+  - there is no `[locale]/loading.tsx`.
+
+  Keep this structure: unknown URLs must return a real HTTP 404.
+- **Images:** use `components/FadeImage.tsx` inside a container with the `skeleton` class (shimmer, then fade and settle from a slight zoom).
+- **Loaders:** `Spinner.tsx`, `NavProgress.tsx` (top bar; dispatch `NAV_START_EVENT` for programmatic navigation). Pending buttons: `disabled` + `aria-busy` + spinner + text.
+
+### i18n
+- Config: `web/src/i18n/config.ts`. UI strings: `web/src/i18n/dictionaries/{locale}.json` — **both files must have identical keys**; `uk.json` is the source of truth for the `Dictionary` type.
+- Interpolation: `t('Hello {name}', { name })`; plurals: `plural(locale, n, forms)` (Intl.PluralRules).
+- CMS content is localized in Strapi (i18n plugin); every data getter in `web/src/lib/strapi.ts` takes `locale`.
+- Adding a language: add it to `locales` in both `web/src/i18n/config.ts` and `cms/src/seed/index.ts` (`LOCALES`), add a dictionary JSON, add a content file next to `cms/src/seed/content/uk.ts` (typed by `content/types.ts`).
+
+### SEO
+- Use `buildMetadata()` from `web/src/lib/seo.ts` in every `generateMetadata` (canonical, hreflang incl. `x-default`, OG, Twitter). It adds " — Бізнес Партнери" only when the title stays ≤ 60 characters (`seoTitle`) and pads descriptions under 100 characters with `meta.descriptionTail` (`seoDescription`). Long service/article titles get a short `seo.metaTitle` from `cms/src/seed/seo.ts`.
+- The root layout sets no canonical/hreflang and no `index` robots directive (only googlebot preview hints), so the 404 page keeps a clean `noindex`. `poweredByHeader: false`.
+- Organization JSON-LD includes `geo` when `global.mapQuery` is coordinates.
+- JSON-LD helpers in `seo.ts`; render with `<JsonLd data={…} />`.
+- Sitemap (`app/sitemap.ts`) lists every locale with alternates — add new routes there.
+- OG images: `opengraph-image.tsx` + `lib/og.tsx` (fonts vendored in `web/src/assets/fonts`, no network).
+
+### News
+- Strapi type `api::news-item.news-item` ("Новина"): title, slug, date, tag, pinned, excerpt, cover, content, seo. Sorted pinned → date desc.
+- Site: `/{locale}/news` (featured first card + grid), `/{locale}/news/[slug]` (NewsArticle JSON-LD), home `NewsSection` (latest 3, hidden when empty), RSS at `/{locale}/news/rss.xml` (linked via `alternates.types`), included in the sitemap.
+- Seed: two **templates as drafts** (`cms/src/seed/news.ts`), created once — never invent published company news.
+
+### Data / CMS
+- Content types: `cms/src/api/*/content-types/*/schema.json`; shared components: `cms/src/components/shared`.
+- Seed: `cms/src/seed/structure.ts` (slugs, categories, ordering, contacts — language-independent) + `cms/src/seed/content/{uk,en}.ts` (texts from the client brief, typed by `content/types.ts`). Seeding runs only on an empty DB (`SEED_ON_EMPTY`); `RESEED_CONTENT=true` (`npm run reseed`) deletes the seeded types first. Strapi limits: `seo.metaTitle` ≤ 70, `metaDescription` ≤ 170 characters.
+- Pages backed by single types: home (`homepage`), about (`about-page`), career (`career-page`, plus `vacancy` collection; the quality-system text `about-page.quality` is shown on the career page at `#quality`). Reports page: `transparency-report` (year, title, file, `isCorrection`, `publishedOn`) — corrected versions are separate entries, originals stay published.
+- Content from the client's **old site** (bp-audit.com.ua, Joomla): structure in `cms/src/seed/legacy.ts`, texts copied **word for word** in `cms/src/seed/old-site/{uk,en}.ts` (written as simple Markdown, converted by `seed/md.ts`; same text as the Claude Doc «Тексти старого сайту bp-audit.com.ua») — extra services (incl. «Консалтинг» = `biznes-konsaltynh`), old publications (publishedAt kept at 2018-10-02), client logos, certificate/recommendation scans (`api::document-image.document-image`, About page galleries — only entries with an image are shown), transparency reports 2019–2025 incl. corrected versions and balance sheets (`docType`), requisites (EDRPOU 37741155, register No. 4463), quality policy. Files are referenced by `sourceUrl`; `npm run import-media` (cms) downloads them into the media library (needs internet; `IMPORT_MEDIA_BASE` overrides the origin). Reports are seeded once, only when none exist.
+- Old URLs: `web/legacy-redirects.ts` (308 redirects via `next.config.ts` `redirects()`, skipped in the Pages demo). Add an entry when a Joomla URL needs a new target.
+- Images from Strapi on a private IP (`STRAPI_URL=http://127.0.0.1:1337`) need `images.dangerouslyAllowLocalIP` (set automatically in `next.config.ts` for private hosts) — Next 16 blocks them otherwise.
+- UI: `MapEmbed` (styled office map: dark contact panel + toned Google Maps iframe by `global.mapQuery` = coordinates of «вулиця Лемківська, 9а» from the client's Google Maps link (pin, JSON-LD geo; the route link also gets `destination_place_id` from the `place_id:` in `mapUrl`) or the optional text `mapPlace`; identical card on home `#map` and contacts; `ensureOfficeLocation` in the CMS bootstrap moves databases still holding an old shipped point), `ScrollToTop` (fixed "back to top" button in the root layout; focuses `<main tabIndex=-1>`).
+- Logo: `components/BrandMark.tsx` (inline SVG, also used by favicons and OG images) is a temporary redraw; replace it with the client's vector original.
+- Strapi writes trigger `POST /api/revalidate` on the web app (`cms/src/index.ts` → `web/src/app/api/revalidate/route.ts`), secured by `REVALIDATE_SECRET`. Direct database writes (reseed, `ensure*` fixes) don't pass that middleware, so the CMS also pings it once after every start. In `next dev` CMS requests are not cached at all (`revalidate: 0`); in production they are cached for `REVALIDATE_SECONDS` (1 h) — and that cache survives restarts in `.next/cache`.
+- Leads: server action `web/src/app/actions.ts`. The client must give a phone **or** an e-mail. The lead goes to:
+  - Strapi `Lead`, via the website API token (it may create leads but never read them);
+  - e-mail via `lib/mail.ts` (nodemailer, SMTP env): a notification to the company (Reply-To = client) and a localized confirmation to the client;
+  - optionally Telegram.
+
+  It counts as delivered if Strapi **or** e-mail succeeded. The validation errors come before the minimum-fill-time check, so an instant empty submit shows errors, never a fake "thank you".
+- **Closed content API:** the Public role has no read access (`ensurePublicPermissions` removes it on every start unless `PUBLIC_CONTENT_API=true`) and nginx returns 403 for `/api/` on the CMS host. `lib/strapi.ts` sends `Authorization: Bearer STRAPI_WEB_TOKEN` on every read; the token «web-site» = `WEB_TOKEN_PERMISSIONS` (find/findOne of site types + `lead.create`), synced on every start by `ensureWebToken`. When you add a content type the site reads, add it to `SITE_READ` in `cms/src/seed/index.ts`. `STRAPI_URL` = internal address (data), `STRAPI_PUBLIC_URL` = address in visitors' browsers (`mediaUrl`).
+- Content protection: Strapi `global.protection` (component `shared.content-protection`, all on by default, missing = all on) → `lib/protection.ts`. `<html data-protect="copy menu images print keys contacts">` drives CSS (globals.css: `user-select`, image drag, print notice) and `components/ContentProtection.tsx` (copy/cut/contextmenu/dragstart/shortcut listeners; form fields, `[data-allow-copy]` and tel/mailto links stay copyable). `robots.ts` adds AI crawlers (`AI_CRAWLERS`) when `blockAiCrawlers`; layout adds `noai` + `tdm-reservation` meta; `proxy.ts` answers 403 to AI crawlers, scraping tools and empty User-Agents (`lib/bots.ts`; only GET from non-local IPs, i.e. through nginx; setting cached 5 min; `BLOCK_BOTS=false` disables). With copying allowed, `ContentProtection` appends «Джерело: URL» to long copies. Certificate/letter scans go through `/api/document/[id]` (watermark by `lib/watermark.ts`, sharp; `documentImageUrl()`; toggle `watermarkDocuments`); the Pages demo uses the originals. Security headers (CSP, frame-ancestors, HSTS on https, COOP, nosniff, Permissions-Policy, tdm-reservation) in `next.config.ts` (not in the Pages demo).
+- CMS bootstrap also: `ensureEditorPermissions` (Editor role gets Content Manager access to every `api::` type, adding only missing permissions), `ensureLeadListView` (Заявка list newest first, useful columns incl. `stage`; applied once per version marker `bpLeadView`) and `ensureAdminLabels` (Ukrainian field labels + help texts from `seed/admin-labels.ts`; only replaces raw field names or labels listed in `PREVIOUS_LABELS`, so admin edits stay). Every new schema field needs an entry in `ADMIN_LABELS` (a test enforces it). The admin UI offers Ukrainian (`src/admin/app.tsx`).
+- Lead processing state is `stage` (new / in_progress / done / spam). Never name a field `status`: Strapi 5 reserves it (draft/published) and the admin can't show it. Rename migrations live in `cms/database/migrations/` (run before the schema sync).
+- `npm run check-mail` (web) tests SMTP and sends a test e-mail. The Pages demo form shows «Демо-версія: заявку не надіслано» (no server there).
+- Strapi drops `?status=draft` on anonymous API requests (`cms/src/index.ts`), so unpublished content never leaks.
+- **Do not invent client facts** (registry numbers, prices, people, reviews). Unknown values stay as visible placeholders the client fills in Strapi.
+
+## Tests
+
+- **Unit + component** (Vitest): `web/tests/*.test.ts` (Node) and `*.test.tsx` (`// @vitest-environment jsdom`, Testing Library); alias `@` → `src`, `server-only` aliased to a stub; `STRAPI_URL=http://cms.test` in tests. `npm run test:coverage` enforces 90 % lines / 85 % branches on `src/lib`, `proxy.ts`, API routes and the tested components (CI runs it). `cms/tests/*.test.ts` (excluded from the Strapi tsconfig/build) with fake `strapi` objects.
+- **End-to-end** (Playwright 1.63, pinned to the preinstalled browser build): `web/e2e/*.spec.ts`, desktop + Pixel 7, against a running production build + CMS (`E2E_BASE_URL`, `E2E_CMS_URL`). CI job `e2e` starts both from scratch; deploys wait for it. Bot tests send `x-real-ip` to look like an outside visitor.
+- Covered: lead parsing/validation (`lib/lead.ts`), rate limiter + client IP (`lib/rate-limit.ts`), secret compare, SEO helpers, phone/format helpers, content protection settings, dictionary parity (uk = en keys and placeholders; plural objects may differ), legacy redirects (unique, targets exist in the seed), locale detection + bot blocking in `proxy.ts`, `lib/bots.ts`, watermark, data layer (`lib/strapi.ts` with mocked fetch), server action `submitLead`, API routes, components (`ContentProtection`, `Blocks`, `LeadForm`, `MapEmbed`); CMS: `md()`, seed integrity (slugs, both languages, team, reports, SEO title ≤ 70), middleware/admin security config, `ensureSecurityBaseline`, public permissions + website token, `ensureOfficeLocation`, admin labels, migrations, nginx/setup.sh guards.
+- New pure helpers get a test; keep server-only code (`'use server'` files) thin and move logic into testable modules.
+
+## Security
+
+Full list with file locations: `docs/SECURITY.md`. When changing related code keep these invariants:
+- `web/next.config.ts` CSP: add an origin only when a feature needs it (images from the CMS, frames from Google Maps). No third-party scripts.
+- Lead form: honeypot + `startedAt` minimum fill time + `leadLimiter`/`leadGlobalLimiter`; all field cleaning in `lib/lead.ts`. The demo (`web/demo/actions.ts`) reuses `parseLead`.
+- `/api/revalidate`: `secretMatches()` + blocked in nginx.
+- CMS: `ensureSecurityBaseline` (no public sign-up, no public lead permissions) and `ensurePublicPermissions` (content API closed) run on every start; no `strapi::poweredBy`; CORS from `PUBLIC_URL` + `SITE_URL` (or `CORS_ORIGINS`); admin login rate limit in `config/admin.ts`.
+- Server: `scripts/server/` (setup.sh, nginx templates with rate limits incl. page GETs, `/api/` closed on the CMS host, hotlink protection, `X-Real-IP`, fail2ban, backup). `valid_referers` must not repeat a name already in `server_names` (nginx refuses to start). The app trusts `X-Real-IP`/last `X-Forwarded-For` hop for rate limiting, so nginx must stay in front.
+- CMS dependencies: Strapi 5.61.0 with `overrides` for `nodemailer` and `zod@^4` (security fixes). Re-run `npm audit --omit=dev` after upgrades.
+
+## CI/CD
+
+- `.github/workflows/deploy.yml`:
+  - every PR runs lint + unit/component tests with coverage + build + type-check, then the Playwright e2e job;
+  - a push to `staging` / `main` rsyncs the code to the VPS and runs `scripts/server-deploy.sh`.
+- `scripts/server-deploy.sh` builds in `releases/<id>`, health-checks, rolls back on failure, and links secrets/data from `shared/`.
+- What is uploaded is controlled by `.deployignore`. Setup: `docs/CI-CD.md`.
+- The CMS must type-check **without** `cms/types/generated` (it isn't in git), so don't rely on generated Strapi types.
+
+## GitHub Pages preview
+
+`.github/workflows/pages-demo.yml` + `web/scripts/prepare-pages-demo.mjs` build a static export (`PAGES_DEMO=1`).
+
+- Anything you add that needs a server (route handlers reading the request, server actions, cookies, ISR, dynamic OG images) must either work under `output: 'export'` or be removed or replaced in `prepare-pages-demo.mjs`.
+- Raw `<a href>` to internal non-page URLs must prefix `process.env.NEXT_PUBLIC_BASE_PATH`. `<Link>` handles it automatically.
+
+## Never commit
+
+`cms/.env`, `web/.env.local`, `cms/.tmp/` (SQLite DB + `web-token.txt`), `cms/public/uploads/`, `node_modules/`, `.next/`, `cms/dist/`, `*.log`.
+
+## Code style
+
+- TypeScript strict, server components by default; `'use client'` only for interactivity.
+- Comments and docs in **English**. User-facing text goes into dictionaries/CMS, never hard-coded.
+- Accessibility: semantic HTML, labelled controls, WAI-ARIA tabs pattern, visible focus, `prefers-reduced-motion`.

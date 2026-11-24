@@ -1,0 +1,280 @@
+# CI + deployment for the Audit Consultant site (Strapi CMS + Next.js).
+#
+#   pull request      → check + end-to-end tests
+#   push to `staging` → check → deploy to the "staging" environment
+#   push to `main`    → check → deploy to the "production" environment,
+#                       or to "staging" while the repository variable MAIN_DEPLOYS_TO=staging (MVP: one server)
+#   Actions tab → "Run workflow" → pick the environment by hand (or "auto" = rules above)
+#
+# The deploy job copies the code to the server over SSH (rsync) and runs scripts/server-deploy.sh there.
+# That script builds in a new release folder while the old version keeps running, switches over,
+# health-checks and rolls back automatically on failure.
+#
+# One-time setup (server + GitHub secrets/variables): docs/CI-CD.md
+
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Where to deploy ("auto" = by branch, see the comment at the top of this file)
+        type: choice
+        options: [auto, staging, production]
+        default: auto
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint, test, build, type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            cms/package-lock.json
+            web/package-lock.json
+
+      - name: CMS — install
+        working-directory: cms
+        run: npm ci --no-audit --no-fund
+
+      - name: CMS — type-check
+        working-directory: cms
+        run: npx tsc --noEmit
+
+      - name: CMS — unit tests
+        working-directory: cms
+        run: npm test
+
+      - name: Web — install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Web — lint
+        working-directory: web
+        run: npm run lint
+
+      - name: Web — unit + component tests (with coverage thresholds)
+        working-directory: web
+        run: npm run test:coverage
+
+      # No CMS is reachable here, so pages prerender with empty data (the "fetch failed" lines in
+      # the log are expected). The goal is to prove the code compiles and every route builds.
+      - name: Web — build
+        working-directory: web
+        env:
+          STRAPI_URL: http://127.0.0.1:9
+          SITE_URL: https://bp-audit.com.ua
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: npm run build
+
+      - name: Web — type-check
+        working-directory: web
+        run: npm run typecheck
+
+  # End-to-end: the real CMS (seeded) + the production website build, driven by Playwright in Chrome (desktop + phone).
+  e2e:
+    name: End-to-end tests
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            cms/package-lock.json
+            web/package-lock.json
+
+      - name: CMS — install
+        working-directory: cms
+        run: npm ci --no-audit --no-fund
+
+      # `npm run dev` creates cms/.env + web/.env.local with random secrets and seeds the empty database.
+      - name: CMS — start with seed content
+        working-directory: cms
+        env:
+          SEED_ON_EMPTY: 'true'
+          WEB_REVALIDATE_URL: http://127.0.0.1:9/disabled
+        run: |
+          nohup npm run dev > ../strapi.log 2>&1 &
+          for i in $(seq 1 150); do curl -sf -o /dev/null http://127.0.0.1:1337/_health && break; sleep 1; done
+          curl -sf -o /dev/null http://127.0.0.1:1337/_health || { tail -80 ../strapi.log; echo "::error::Strapi did not start"; exit 1; }
+          token=$(tr -d '[:space:]' < .tmp/web-token.txt)
+          echo "::add-mask::$token"
+          echo "STRAPI_WEB_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Web — install
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Web — build and start (production mode)
+        working-directory: web
+        env:
+          STRAPI_URL: http://127.0.0.1:1337
+          SITE_URL: http://localhost:3000
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          npm run build
+          nohup env PORT=3000 HOSTNAME=127.0.0.1 npm start > ../web.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:3000/uk && break; sleep 1; done
+          curl -sf -o /dev/null http://127.0.0.1:3000/uk || { tail -80 ../web.log; echo "::error::The website did not start"; exit 1; }
+
+      - name: Playwright — browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright — run
+        working-directory: web
+        env:
+          E2E_BASE_URL: http://localhost:3000
+          E2E_CMS_URL: http://127.0.0.1:1337
+        run: npm run test:e2e
+
+      - name: Logs and report (on failure)
+        if: failure()
+        run: |
+          tail -100 strapi.log || true
+          tail -100 web.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          retention-days: 7
+
+  # Decides which GitHub environment (and therefore which server, secrets and variables) to deploy to.
+  target:
+    name: Pick environment
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.pick.outputs.environment }}
+    steps:
+      - id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          CHOSEN: ${{ inputs.environment }}
+          MAIN_DEPLOYS_TO: ${{ vars.MAIN_DEPLOYS_TO }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] && [ -n "$CHOSEN" ] && [ "$CHOSEN" != auto ]; then
+            target="$CHOSEN"
+          elif [ "$BRANCH" = staging ]; then
+            target=staging
+          elif [ "$BRANCH" = main ]; then
+            target="${MAIN_DEPLOYS_TO:-production}"
+          else
+            target=""
+          fi
+          case "$target" in staging|production|"") ;; *) echo "::error::MAIN_DEPLOYS_TO must be 'staging' or 'production' (got '$target')"; exit 1 ;; esac
+          if [ -z "$target" ]; then
+            echo "::notice::Branch '$BRANCH' is not deployed automatically. Use 'Run workflow' and choose an environment."
+          else
+            echo "::notice::Deploying '$BRANCH' to the '$target' environment"
+          fi
+          echo "environment=$target" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy (${{ needs.target.outputs.environment }})
+    needs: [check, e2e, target]
+    if: needs.target.outputs.environment != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ needs.target.outputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    # Never run two deploys to the same environment at once; queue instead of cancelling.
+    concurrency:
+      group: deploy-${{ needs.target.outputs.environment }}
+      cancel-in-progress: false
+    env:
+      DEPLOY_ENV: ${{ needs.target.outputs.environment }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+      APP_DIR: ${{ vars.APP_DIR }}
+      APP_NAME: ${{ vars.APP_NAME || 'audit' }}
+      CMS_PORT: ${{ vars.CMS_PORT || '1337' }}
+      WEB_PORT: ${{ vars.WEB_PORT || '3000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        id: cfg
+        run: |
+          # Nothing configured for this environment yet (e.g. no server during the MVP): skip, don't fail.
+          if [ -z "$SSH_HOST$SSH_USER$SSH_PRIVATE_KEY$APP_DIR" ]; then
+            echo "::warning::No server is configured for the '$DEPLOY_ENV' environment yet — deploy skipped. (The GitHub Pages preview is published by pages-demo.yml.) To enable: docs/CI-CD.md"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=0
+          for v in SSH_HOST SSH_USER SSH_PRIVATE_KEY APP_DIR; do
+            if [ -z "${!v}" ]; then echo "::error::$v is not set for the '$DEPLOY_ENV' environment"; missing=1; fi
+          done
+          if [ -n "$APP_DIR" ]; then
+            case "$APP_DIR" in /*) ;; *) echo "::error::APP_DIR must be an absolute path, e.g. /srv/audit-staging"; missing=1 ;; esac
+          fi
+          if [ "$missing" = 1 ]; then
+            echo "::error::Add them in Settings → Environments → '$DEPLOY_ENV' (secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS; variable: APP_DIR). Values saved in another environment are not visible here. To send pushes to main to staging, set the repository variable MAIN_DEPLOYS_TO=staging. Details: docs/CI-CD.md"
+          fi
+          exit $missing
+
+      - name: Set up SSH
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::SSH_KNOWN_HOSTS is not set — trusting the server key on first use. Add the secret to protect against MITM (docs/CI-CD.md)."
+            ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName $SSH_HOST
+            User $SSH_USER
+            Port $SSH_PORT
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+          ssh deploy-target 'echo "connected to $(hostname)"'
+
+      - name: Upload release
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          REL="$APP_DIR/releases/$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
+          echo "REL=$REL" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2029 # $REL is meant to expand here, on the runner
+          ssh deploy-target "mkdir -p '$REL'"
+          rsync -az --delete --exclude-from=.deployignore ./ "deploy-target:$REL/"
+
+      - name: Build, switch, health-check (rolls back on failure)
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          # shellcheck disable=SC2029 # values are meant to expand here, on the runner
+          ssh deploy-target "APP_NAME='$APP_NAME' CMS_PORT='$CMS_PORT' WEB_PORT='$WEB_PORT' bash '$REL/scripts/server-deploy.sh' '$REL'"
