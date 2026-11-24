@@ -45,11 +45,7 @@ export default function SiteHeader({
           <ConceptNav items={nav} label={dict.nav.mainMenu} />
           <div className="bar-end">
             <div className="max-md:hidden">
-              <LanguageSwitcher
-                locale={locale}
-                label={dict.nav.language}
-                busyLabel={dict.common.switchingLanguage}
-              />
+              <LanguageSwitcher locale={locale} label={dict.nav.language} />
             </div>
             <Link
               className="btn btn-accent btn-sm max-[420px]:hidden"
