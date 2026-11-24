@@ -55,7 +55,7 @@ jobs:
       - name: CMS — start with seed content
         working-directory: cms
         env:
-          SEED_ON_EMPTY: 'true'
+          SEED_ON_EMPTY: "true"
           WEB_REVALIDATE_URL: http://127.0.0.1:9/disabled
         run: |
           nohup npm run dev > ../strapi.log 2>&1 &
@@ -78,17 +78,19 @@ jobs:
 
       - name: Web — prepare server-less demo source
         working-directory: web
-        run: node scripts/prepare-pages-demo.mjs
+        run: |
+          node scripts/prepare-pages-demo.mjs
+          rm -rf tests e2e
 
       - name: Web — static build
         working-directory: web
         env:
-          PAGES_DEMO: '1'
+          PAGES_DEMO: "1"
           PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
           SITE_URL: ${{ steps.pages.outputs.base_url }}
           STRAPI_URL: http://127.0.0.1:1337
-          NO_INDEX: 'true'
-          NEXT_TELEMETRY_DISABLED: '1'
+          NO_INDEX: "true"
+          NEXT_TELEMETRY_DISABLED: "1"
         run: |
           npm run build
           node scripts/finish-pages-demo.mjs
